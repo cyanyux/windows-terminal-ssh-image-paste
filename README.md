@@ -1,4 +1,4 @@
-# terminal-ssh-image-paste
+# windows-terminal-ssh-image-paste
 
 Windows-side image paste bridge for SSH sessions in Windows Terminal.
 
@@ -34,8 +34,8 @@ The goal is not native GUI image attachments. The goal is reliable terminal work
 Run from PowerShell on Windows:
 
 ```powershell
-git clone https://github.com/cyanyux/terminal-ssh-image-paste.git
-cd terminal-ssh-image-paste
+git clone https://github.com/cyanyux/windows-terminal-ssh-image-paste.git
+cd windows-terminal-ssh-image-paste
 .\scripts\install.ps1
 ```
 
