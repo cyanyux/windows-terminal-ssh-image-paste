@@ -1,5 +1,7 @@
 param(
-    [Parameter(ValueFromRemainingArguments = $true)]
+    [switch]$Here,
+
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$SshArgs
 )
 

@@ -4,6 +4,7 @@
 global PowerShellExe := A_WinDir "\System32\WindowsPowerShell\v1.0\powershell.exe"
 global HelperScript := A_ScriptDir "\ClaudeSshImagePaste.ps1"
 global StateDir := EnvGet("LOCALAPPDATA") "\ClaudeSshImagePaste"
+global SessionDir := StateDir "\sessions"
 global SessionPath := StateDir "\session.json"
 global AhkLogPath := StateDir "\ahk.log"
 global PasteInFlight := false
@@ -18,7 +19,7 @@ WriteDebugLog(message) {
     }
 }
 
-WriteDebugLog("script loaded | pid=" DllCall("GetCurrentProcessId") " | session=" SessionPath)
+WriteDebugLog("script loaded | pid=" DllCall("GetCurrentProcessId") " | sessionDir=" SessionDir)
 
 GetActiveClaudeSshMarker() {
     title := WinGetTitle("A")
@@ -33,7 +34,27 @@ GetActiveWindowHandle() {
 }
 
 HasBoundSession(windowHandle) {
-    if (windowHandle = "" || !FileExist(SessionPath)) {
+    if (windowHandle = "") {
+        return false
+    }
+
+    normalized := NormalizeWindowHandle(windowHandle)
+
+    if DirExist(SessionDir) {
+        Loop Files, SessionDir "\*.json", "F" {
+            try {
+                sessionJson := FileRead(A_LoopFileFullPath, "UTF-8")
+            } catch {
+                continue
+            }
+
+            if (RegExMatch(sessionJson, '"windowHandle"\s*:\s*"' normalized '"') > 0) {
+                return true
+            }
+        }
+    }
+
+    if !FileExist(SessionPath) {
         return false
     }
 
@@ -43,7 +64,7 @@ HasBoundSession(windowHandle) {
         return false
     }
 
-    return RegExMatch(sessionJson, '"windowHandle"\s*:\s*"' windowHandle '"') > 0
+    return RegExMatch(sessionJson, '"windowHandle"\s*:\s*"' normalized '"') > 0
 }
 
 BuildHelperCommand(action, windowHandle, marker, extraArgs := "") {
@@ -59,8 +80,51 @@ BuildHelperCommand(action, windowHandle, marker, extraArgs := "") {
     return commandLine
 }
 
-PasteTextViaTerminal(text) {
+NormalizeWindowHandle(windowHandle) {
+    if (windowHandle = "") {
+        return ""
+    }
+
+    normalized := Trim(windowHandle)
+    if RegExMatch(normalized, "^0x[0-9A-Fa-f]+$") {
+        return "0x" Format("{:X}", Integer(normalized))
+    }
+
+    if RegExMatch(normalized, "^\d+$") {
+        return "0x" Format("{:X}", Integer(normalized))
+    }
+
+    return normalized
+}
+
+IsUploadBlockingWindow() {
+    global PasteInFlight
+    global ActiveUpload
+
+    if (!PasteInFlight || !IsObject(ActiveUpload)) {
+        return false
+    }
+
+    return NormalizeWindowHandle(GetActiveWindowHandle()) = NormalizeWindowHandle(ActiveUpload.WindowHandle)
+}
+
+PasteTextViaTerminal(windowHandle, text) {
+    targetWindow := NormalizeWindowHandle(windowHandle)
+    if (targetWindow != "") {
+        targetSpec := "ahk_id " targetWindow
+        if WinExist(targetSpec) {
+            if NormalizeWindowHandle(GetActiveWindowHandle()) != targetWindow {
+                WinActivate targetSpec
+                try WinWaitActive targetSpec, , 0.5
+            }
+            if NormalizeWindowHandle(GetActiveWindowHandle()) != targetWindow {
+                return false
+            }
+        }
+    }
+
     SendText text
+    return true
 }
 
 ExecCommandHidden(commandLine) {
@@ -136,6 +200,22 @@ FinishAsyncCommand(task) {
     }
 }
 
+NotifyUploadFailure(task, stderrText) {
+    summary := "Image upload failed for " task.RemotePath
+    details := Trim(stderrText, "`r`n ")
+    if (details != "") {
+        summary .= "`n" details
+    }
+
+    SoundBeep 750, 120
+    try TrayTip summary, "terminal-ssh-image-paste", 17
+}
+
+NotifyPasteFailure(reason) {
+    SoundBeep 600, 120
+    try TrayTip reason, "terminal-ssh-image-paste", 17
+}
+
 PollUpload(*) {
     global PasteInFlight
     global ActiveUpload
@@ -154,6 +234,7 @@ PollUpload(*) {
         WriteDebugLog("background upload complete | title=" ActiveUpload.Title " | marker=" ActiveUpload.Marker " | hwnd=" ActiveUpload.WindowHandle " | path=" ActiveUpload.RemotePath)
     } else {
         WriteDebugLog("background upload failed | title=" ActiveUpload.Title " | marker=" ActiveUpload.Marker " | hwnd=" ActiveUpload.WindowHandle " | exit=" result.ExitCode " | stderr=" Trim(result.StdErr, "`r`n"))
+        NotifyUploadFailure(ActiveUpload, result.StdErr)
     }
 
     PasteInFlight := false
@@ -161,7 +242,7 @@ PollUpload(*) {
     SetTimer PollUpload, 0
 }
 
-#HotIf WinActive("ahk_exe WindowsTerminal.exe") && PasteInFlight
+#HotIf WinActive("ahk_exe WindowsTerminal.exe") && IsUploadBlockingWindow()
 Enter::
 {
     WriteDebugLog("blocked Enter while upload in flight")
@@ -198,32 +279,37 @@ $^v::
         return
     }
 
-    prepareCommand := BuildHelperCommand("prepare-image", windowHandle, marker)
-    result := ExecCommandHidden(prepareCommand)
-    response := Trim(result.StdOut, "`r`n")
-
-    if (result.ExitCode != 0 || response = "") {
-        WriteDebugLog("prepare failed | title=" title " | marker=" marker " | hwnd=" windowHandle " | exit=" result.ExitCode " | stderr=" Trim(result.StdErr, "`r`n"))
-        Send "^v"
-        return
-    }
-
-    fields := StrSplit(response, "|")
-    if (fields.Length < 3) {
-        WriteDebugLog("prepare parse failed | title=" title " | marker=" marker " | hwnd=" windowHandle " | stdout=" response)
-        Send "^v"
-        return
-    }
-
-    state := fields[1]
-    remotePath := fields[2]
-    hash := fields[3]
-
     try {
-        PasteTextViaTerminal(remotePath)
+        prepareCommand := BuildHelperCommand("prepare-image", windowHandle, marker)
+        result := ExecCommandHidden(prepareCommand)
+        response := Trim(result.StdOut, "`r`n")
+
+        if (result.ExitCode != 0 || response = "") {
+            WriteDebugLog("prepare failed | title=" title " | marker=" marker " | hwnd=" windowHandle " | exit=" result.ExitCode " | stderr=" Trim(result.StdErr, "`r`n"))
+            Send "^v"
+            return
+        }
+
+        fields := StrSplit(response, "|")
+        if (fields.Length < 3) {
+            WriteDebugLog("prepare parse failed | title=" title " | marker=" marker " | hwnd=" windowHandle " | stdout=" response)
+            Send "^v"
+            return
+        }
+
+        state := fields[1]
+        remotePath := fields[2]
+        hash := fields[3]
+
+        if !PasteTextViaTerminal(windowHandle, remotePath) {
+            NotifyPasteFailure("Image paste cancelled because the target terminal is no longer focused.")
+            WriteDebugLog("paste cancelled because target window was not active | title=" title " | marker=" marker " | hwnd=" windowHandle)
+            return
+        }
         WriteDebugLog("path inserted | title=" title " | marker=" marker " | hwnd=" windowHandle " | state=" state " | path=" remotePath)
     } catch as err {
         WriteDebugLog("paste dispatch failed | title=" title " | marker=" marker " | hwnd=" windowHandle " | error=" err.Message)
+        NotifyPasteFailure("Image paste failed before the path could be inserted.")
         return
     }
 

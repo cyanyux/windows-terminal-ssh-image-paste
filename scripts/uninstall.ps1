@@ -18,14 +18,52 @@ function Write-Info([string]$Message) {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+function Remove-LegacyProfileEntries([string]$Content) {
+    $patterns = @(
+        '(?ms)^\s*function\s+cssh\s*\{.*?ClaudeSsh\.ps1.*?^\}\s*',
+        '(?ms)^\s*function\s+cssh-here\s*\{.*?ClaudeSsh\.ps1.*?^\}\s*',
+        '(?ms)^\s*function\s+cssh-on\s*\{.*?ClaudeSshImagePaste\.ps1.*?^\}\s*',
+        '(?ms)^\s*function\s+cssh-off\s*\{.*?ClaudeSshImagePaste\.ps1.*?^\}\s*',
+        '(?ms)^\s*function\s+cssh-status\s*\{.*?ClaudeSshImagePaste\.ps1.*?^\}\s*'
+    )
+
+    foreach ($pattern in $patterns) {
+        $Content = [regex]::Replace($Content, $pattern, "", "Multiline")
+    }
+
+    return $Content
+}
+
+function Remove-ManagedProfileBlocks([string]$Content) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $insideManagedBlock = $false
+
+    foreach ($line in ($Content -split "`r?`n")) {
+        $trimmed = $line.Trim([char]0xFEFF)
+        if ($trimmed -eq $ProfileBlockStart) {
+            $insideManagedBlock = $true
+            continue
+        }
+        if ($trimmed -eq $ProfileBlockEnd) {
+            $insideManagedBlock = $false
+            continue
+        }
+        if (-not $insideManagedBlock) {
+            $lines.Add($line)
+        }
+    }
+
+    return ($lines -join "`r`n")
+}
+
 function Remove-ProfileBlock([string]$ProfilePath) {
     if (-not (Test-Path $ProfilePath)) {
         return
     }
 
     $content = Get-Content -Path $ProfilePath -Raw
-    $pattern = "(?ms)\r?\n?" + [regex]::Escape($ProfileBlockStart) + ".*?" + [regex]::Escape($ProfileBlockEnd) + "\r?\n?"
-    $updated = [regex]::Replace($content, $pattern, "`r`n")
+    $content = Remove-LegacyProfileEntries -Content $content
+    $updated = Remove-ManagedProfileBlocks -Content $content
     Set-Content -Path $ProfilePath -Value $updated.TrimEnd("`r", "`n") + "`r`n" -Encoding UTF8
 }
 

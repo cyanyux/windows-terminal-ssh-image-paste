@@ -2,7 +2,9 @@
 
 Windows-side image paste bridge for SSH sessions in Windows Terminal.
 
-It is designed for terminal-first tools such as Claude Code and Codex CLI running on a remote Linux host. When you press `Ctrl+V` inside a `cssh` session, the tool:
+It is designed for terminal-first tools such as Claude Code and Codex CLI running on a remote Linux host. `cssh` keeps the SSH session in the current Windows Terminal tab. This works as long as you stay on that tab while pasting the image path and while the upload is still in flight.
+
+When you press `Ctrl+V` inside a `cssh` session, the tool:
 
 1. Reserves a short remote image path like `/tmp/i/1.png`
 2. Inserts that path into the current terminal tab immediately
@@ -54,17 +56,19 @@ The installer will:
 
 ## Quick Start
 
-Open a new PowerShell tab in Windows Terminal, then:
+Open a PowerShell tab in Windows Terminal, then:
 
 ```powershell
 cssh user@host
 ```
 
-Inside that SSH session:
+`cssh` stays in the current Windows Terminal tab. Inside that SSH session:
 
 1. copy an image to the Windows clipboard
 2. press `Ctrl+V`
 3. wait briefly before pressing `Enter`
+
+`cssh-here` is kept as an explicit alias for the same in-place behavior.
 
 If you are already inside an SSH tab and want to bind it manually:
 
@@ -78,12 +82,15 @@ cssh-off
 
 ```powershell
 cssh user@host
+cssh-here user@host
 cssh-status
 cssh-on -Target user@host -WindowHandle 0x12345
 cssh-off -Marker __CSSH__:...
 ```
 
-`cssh` is the normal entrypoint. It wraps `ssh.exe`, binds the current Windows Terminal window to the SSH target, and clears the binding when the SSH process exits.
+`cssh` is the normal entrypoint. It runs `ssh.exe` in the current Windows Terminal tab, binds that window to the SSH target, and clears the binding when the SSH process exits.
+
+`cssh-here` is an explicit alias for the same in-place behavior as `cssh`.
 
 ## Uninstall
 
@@ -136,7 +143,7 @@ scripts/
 
 - This is for terminal workflows, not GUI attachment chips.
 - The remote path is inserted before upload completes, so `Enter` is blocked during upload.
-- Session binding is scoped to a Windows Terminal window. If you manually reuse the same window for unrelated SSH flows, use `cssh` instead of `ssh` so the binding is refreshed correctly.
+- Session binding is scoped to a Windows Terminal window, not a tab. If you use `cssh`/`cssh-here` in a window that also contains local WSL tabs, do not switch to another tab between copying and pasting.
 
 ## License
 

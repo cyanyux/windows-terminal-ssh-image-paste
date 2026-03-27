@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("set-session", "clear-session", "status", "paste-image", "prepare-image", "upload-image")]
+    [ValidateSet("set-session", "clear-session", "status", "paste-image", "prepare-image", "upload-image", "reserve-path")]
     [string]$Command = "status",
 
     [string]$Target,
@@ -14,15 +14,17 @@ $ErrorActionPreference = "Stop"
 
 $StateDir = Join-Path $env:LOCALAPPDATA "ClaudeSshImagePaste"
 $SessionPath = Join-Path $StateDir "session.json"
+$SessionDir = Join-Path $StateDir "sessions"
 $LogPath = Join-Path $StateDir "paste.log"
 $ImageDir = Join-Path $StateDir "images"
 $UploadCacheDir = Join-Path $StateDir "upload-cache"
 $RemoteReadyDir = Join-Path $StateDir "remote-ready"
 $RemoteNameDir = Join-Path $StateDir "remote-names"
 $PendingDir = Join-Path $StateDir "pending"
+$LockDir = Join-Path $StateDir "locks"
 
 function Ensure-StateDir {
-    foreach ($dir in @($StateDir, $ImageDir, $UploadCacheDir, $RemoteReadyDir, $RemoteNameDir, $PendingDir)) {
+    foreach ($dir in @($StateDir, $SessionDir, $ImageDir, $UploadCacheDir, $RemoteReadyDir, $RemoteNameDir, $PendingDir, $LockDir)) {
         if (-not (Test-Path $dir)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
@@ -36,8 +38,13 @@ function Get-DefaultRemoteDir {
 function Write-Log {
     param([string]$Message)
 
-    Ensure-StateDir
-    Add-Content -Path $LogPath -Value ("{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"), $Message)
+    try {
+        Ensure-StateDir
+        Add-Content -Path $LogPath -Value ("{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"), $Message) -ErrorAction Stop
+    } catch {
+        # Best-effort logging only; operational paths should keep working even if
+        # multiple helper processes race on the log file.
+    }
 }
 
 function Normalize-WindowHandle {
@@ -83,6 +90,41 @@ function New-SessionEntry {
         remoteDir    = $ResolvedRemoteDir
         updatedAt    = (Get-Date).ToString("o")
     }
+}
+
+function Get-SessionFilePath {
+    param([string]$ResolvedMarker)
+
+    if ([string]::IsNullOrWhiteSpace($ResolvedMarker)) {
+        throw "Marker is required."
+    }
+
+    Ensure-StateDir
+    $safeMarker = ($ResolvedMarker -replace '[<>:"/\\|?*]', '_')
+    return (Join-Path $SessionDir ("{0}.json" -f $safeMarker))
+}
+
+function Get-SessionFileEntries {
+    Ensure-StateDir
+    $entries = @()
+
+    foreach ($file in @(Get-ChildItem -Path $SessionDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+        try {
+            $raw = Get-Content -Path $file.FullName -Raw | ConvertFrom-Json
+            if ([string]::IsNullOrWhiteSpace($raw.target) -or [string]::IsNullOrWhiteSpace($raw.marker)) {
+                continue
+            }
+
+            $entries += [pscustomobject]@{
+                path    = $file.FullName
+                session = (New-SessionEntry -ResolvedTarget $raw.target -ResolvedMarker $raw.marker -ResolvedWindowHandle $raw.windowHandle -ResolvedRemoteDir $(if ([string]::IsNullOrWhiteSpace($raw.remoteDir)) { Get-DefaultRemoteDir } else { $raw.remoteDir }))
+            }
+        } catch {
+            Write-Log ("Ignoring invalid session file {0}: {1}" -f $file.FullName, $_.Exception.Message)
+        }
+    }
+
+    return $entries
 }
 
 function Convert-LegacySessionToState {
@@ -136,7 +178,14 @@ function Normalize-State {
 }
 
 function Get-State {
-    Ensure-StateDir
+    $entries = @(Get-SessionFileEntries)
+    if ($entries.Count -gt 0) {
+        return [pscustomobject]@{
+            version  = 2
+            sessions = @($entries | ForEach-Object { $_.session })
+        }
+    }
+
     if (-not (Test-Path $SessionPath)) {
         return [pscustomobject](Get-DefaultState)
     }
@@ -148,13 +197,6 @@ function Get-State {
         Write-Log ("Session parse failed, resetting: {0}" -f $_.Exception.Message)
         return [pscustomobject](Get-DefaultState)
     }
-}
-
-function Save-State {
-    param([psobject]$State)
-
-    Ensure-StateDir
-    (Normalize-State -Raw $State) | ConvertTo-Json -Depth 5 | Set-Content -Path $SessionPath -Encoding UTF8
 }
 
 function Get-Sessions {
@@ -192,7 +234,13 @@ function Get-SessionByWindowHandle {
         return $null
     }
 
-    foreach ($session in @(Get-Sessions -State $State)) {
+    $sessions = @(
+        @(Get-Sessions -State $State) |
+            Where-Object { (Normalize-WindowHandle -Value $_.windowHandle) -eq $normalizedWindowHandle } |
+            Sort-Object updatedAt -Descending
+    )
+
+    foreach ($session in $sessions) {
         if ((Normalize-WindowHandle -Value $session.windowHandle) -eq $normalizedWindowHandle) {
             return $session
         }
@@ -346,6 +394,44 @@ function Get-PendingPath {
     return (Join-Path $PendingDir ("{0}-{1}.txt" -f $CacheKey, $Hash))
 }
 
+function Invoke-WithFileLock {
+    param(
+        [string]$LockName,
+        [scriptblock]$ScriptBlock
+    )
+
+    Ensure-StateDir
+    $mutexNameHash = Get-StringHashHex -Value ("{0}|{1}" -f $StateDir, $LockName)
+    $mutexName = "Global\ClaudeSshImagePaste-{0}" -f $mutexNameHash.Substring(0, 32)
+    $mutex = [System.Threading.Mutex]::new($false, $mutexName)
+    $lockTaken = $false
+
+    try {
+        try {
+            $lockTaken = $mutex.WaitOne(5000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockTaken = $true
+        }
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+
+    if (-not $lockTaken) {
+        $mutex.Dispose()
+        throw "Timed out acquiring lock '$LockName'."
+    }
+
+    try {
+        return (& $ScriptBlock)
+    } finally {
+        if ($lockTaken) {
+            $mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
+}
+
 function Get-RemoteFileName {
     param([string]$CacheKey)
 
@@ -464,41 +550,43 @@ function Resolve-OrReserveRemotePath {
 
     Ensure-StateDir
     $cacheKey = Get-RemoteCacheKey -ResolvedTarget $ResolvedTarget -ResolvedRemoteDir $ResolvedRemoteDir
-    $cachePath = Get-UploadCachePath -CacheKey $cacheKey -Hash $Hash
-    if (Test-Path $cachePath) {
-        $cachedRemotePath = (Get-Content -Path $cachePath -Raw).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($cachedRemotePath)) {
-            return [pscustomobject]@{
-                state     = "ready"
-                cacheKey  = $cacheKey
-                remotePath = $cachedRemotePath
-                cachePath = $cachePath
+    return Invoke-WithFileLock -LockName ("reserve-{0}" -f $cacheKey) -ScriptBlock {
+        $cachePath = Get-UploadCachePath -CacheKey $cacheKey -Hash $Hash
+        if (Test-Path $cachePath) {
+            $cachedRemotePath = (Get-Content -Path $cachePath -Raw).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($cachedRemotePath)) {
+                return [pscustomobject]@{
+                    state      = "ready"
+                    cacheKey   = $cacheKey
+                    remotePath = $cachedRemotePath
+                    cachePath  = $cachePath
+                }
             }
         }
-    }
 
-    $pendingPath = Get-PendingPath -CacheKey $cacheKey -Hash $Hash
-    if (Test-Path $pendingPath) {
-        $pendingRemotePath = (Get-Content -Path $pendingPath -Raw).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($pendingRemotePath)) {
-            return [pscustomobject]@{
-                state      = "pending"
-                cacheKey   = $cacheKey
-                remotePath = $pendingRemotePath
-                cachePath  = $cachePath
-                pendingPath = $pendingPath
+        $pendingPath = Get-PendingPath -CacheKey $cacheKey -Hash $Hash
+        if (Test-Path $pendingPath) {
+            $pendingRemotePath = (Get-Content -Path $pendingPath -Raw).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($pendingRemotePath)) {
+                return [pscustomobject]@{
+                    state       = "pending"
+                    cacheKey    = $cacheKey
+                    remotePath  = $pendingRemotePath
+                    cachePath   = $cachePath
+                    pendingPath = $pendingPath
+                }
             }
         }
-    }
 
-    $remotePath = ("{0}/{1}" -f $ResolvedRemoteDir.TrimEnd("/"), (Get-RemoteFileName -CacheKey $cacheKey))
-    Set-Content -Path $pendingPath -Value $remotePath -Encoding UTF8
-    return [pscustomobject]@{
-        state      = "pending"
-        cacheKey   = $cacheKey
-        remotePath = $remotePath
-        cachePath  = $cachePath
-        pendingPath = $pendingPath
+        $remotePath = ("{0}/{1}" -f $ResolvedRemoteDir.TrimEnd("/"), (Get-RemoteFileName -CacheKey $cacheKey))
+        Set-Content -Path $pendingPath -Value $remotePath -Encoding UTF8
+        return [pscustomobject]@{
+            state       = "pending"
+            cacheKey    = $cacheKey
+            remotePath  = $remotePath
+            cachePath   = $cachePath
+            pendingPath = $pendingPath
+        }
     }
 }
 
@@ -553,10 +641,12 @@ function Invoke-RemoteUpload {
         }
     }
 
-    Set-Content -Path $cachePath -Value $remotePath -Encoding UTF8
-    if ($pendingPath) {
-        try { Remove-Item -Path $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
-    }
+    Invoke-WithFileLock -LockName ("reserve-{0}" -f $cacheKey) -ScriptBlock {
+        Set-Content -Path $cachePath -Value $remotePath -Encoding UTF8
+        if ($pendingPath) {
+            try { Remove-Item -Path $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    } | Out-Null
     return $remotePath
 }
 
@@ -571,20 +661,40 @@ switch ($Command) {
             $resolvedMarker = "__CSSH__:{0}" -f ([guid]::NewGuid().ToString("N"))
         }
 
-        $state = Get-State
         $session = New-SessionEntry -ResolvedTarget $Target -ResolvedMarker $resolvedMarker -ResolvedWindowHandle $WindowHandle -ResolvedRemoteDir $RemoteDir
-        Save-State -State (Upsert-Session -State $state -Session $session)
+        $sessionFilePath = Get-SessionFilePath -ResolvedMarker $resolvedMarker
+        $session | ConvertTo-Json -Depth 5 | Set-Content -Path $sessionFilePath -Encoding UTF8
+        Remove-Item -Path $SessionPath -Force -ErrorAction SilentlyContinue
+
+        foreach ($entry in @(Get-SessionFileEntries)) {
+            if ($entry.session.marker -eq $resolvedMarker) {
+                continue
+            }
+
+            $sameWindowHandle =
+                -not [string]::IsNullOrWhiteSpace($entry.session.windowHandle) -and
+                -not [string]::IsNullOrWhiteSpace($session.windowHandle) -and
+                (Normalize-WindowHandle -Value $entry.session.windowHandle) -eq (Normalize-WindowHandle -Value $session.windowHandle)
+
+            if ($sameWindowHandle) {
+                Remove-Item -Path $entry.path -Force -ErrorAction SilentlyContinue
+            }
+        }
+
         Write-Log ("Enabled session {0} -> {1} (hwnd={2})" -f $resolvedMarker, $Target, $(if ([string]::IsNullOrWhiteSpace($WindowHandle)) { "(unset)" } else { $WindowHandle }))
         Write-Output ("Enabled session for {0} ({1})" -f $Target, $resolvedMarker)
     }
 
     "clear-session" {
-        $state = Get-State
-        Save-State -State (Remove-Session -State $state -ResolvedMarker $Marker)
         if ([string]::IsNullOrWhiteSpace($Marker)) {
+            Get-ChildItem -Path $SessionDir -Filter "*.json" -File -ErrorAction SilentlyContinue |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $SessionPath -Force -ErrorAction SilentlyContinue
             Write-Log "Cleared all sessions."
             Write-Output "Cleared all sessions."
         } else {
+            $sessionFilePath = Get-SessionFilePath -ResolvedMarker $Marker
+            Remove-Item -Path $sessionFilePath -Force -ErrorAction SilentlyContinue
             Write-Log ("Cleared session {0}" -f $Marker)
             Write-Output ("Cleared session {0}." -f $Marker)
         }
@@ -598,7 +708,10 @@ switch ($Command) {
             Write-Output ("Session:      {0} => {1} ({2})" -f $session.marker, $session.target, $session.remoteDir)
             Write-Output ("Window:       {0}" -f ($(if ($session.windowHandle) { $session.windowHandle } else { "(unset)" })))
         }
-        Write-Output ("Session file: {0}" -f $SessionPath)
+        Write-Output ("Session dir:  {0}" -f $SessionDir)
+        if (Test-Path $SessionPath) {
+            Write-Output ("Legacy file:  {0}" -f $SessionPath)
+        }
         Write-Output ("Log file:     {0}" -f $LogPath)
     }
 
@@ -634,5 +747,19 @@ switch ($Command) {
         $remotePath = Invoke-RemoteUpload -ResolvedTarget $context.target -ResolvedRemoteDir $context.remoteDir -LocalPath $localPath -Hash $Hash
         Write-Log ("Uploaded {0} -> {1}:{2}" -f $Hash, $context.target, $remotePath)
         Write-Output $remotePath
+    }
+
+    "reserve-path" {
+        if ([string]::IsNullOrWhiteSpace($Hash)) {
+            throw "Hash is required."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($RemoteDir) -or $PSBoundParameters.ContainsKey("RemoteDir") -eq $false) {
+            $RemoteDir = ""
+        }
+
+        $context = Resolve-SessionContext -ResolvedTarget $Target -ResolvedMarker $Marker -ResolvedWindowHandle $WindowHandle -ResolvedRemoteDir $RemoteDir
+        $reservation = Resolve-OrReserveRemotePath -ResolvedTarget $context.target -ResolvedRemoteDir $context.remoteDir -Hash $Hash
+        Write-Output ("{0}|{1}" -f $reservation.state.ToUpperInvariant(), $reservation.remotePath)
     }
 }
