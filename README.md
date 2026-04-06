@@ -1,35 +1,63 @@
-# windows-terminal-ssh-image-paste
+# Paste Images into SSH Sessions from Windows Terminal
 
-Windows-side image paste bridge for SSH sessions in Windows Terminal.
+**Ctrl+V clipboard images straight into Claude Code, Codex CLI, or any terminal tool running over SSH.**
 
-It is designed for terminal-first tools such as Claude Code and Codex CLI running on a remote Linux host. `cssh` keeps the SSH session in the current Windows Terminal tab. This works as long as you stay on that tab while pasting the image path and while the upload is still in flight.
+Windows Terminal does not support pasting images into remote SSH sessions. This tool bridges that gap: it intercepts `Ctrl+V`, saves the clipboard image locally, uploads it to the remote host via `scp`, and inserts the remote file path into your terminal — all without leaving your current tab.
 
-When you press `Ctrl+V` inside a `cssh` session, the tool:
+## The Problem
 
-1. Reserves a short remote image path like `/tmp/i/1.png`
-2. Inserts that path into the current terminal tab immediately
-3. Uploads the clipboard image to the remote host in the background
-4. Temporarily blocks `Enter` while the upload is in flight, so the CLI does not read the path before the file exists
+You are running Claude Code (or another AI coding assistant) on a remote Linux server via SSH. You want to paste a screenshot for context. You press `Ctrl+V` and… nothing useful happens. Windows Terminal has no way to send clipboard images over SSH.
 
-The goal is not native GUI image attachments. The goal is reliable terminal workflow over SSH.
+## The Solution
 
-## What You Get
+`cssh` wraps your SSH connection and enables image pasting:
 
-- Immediate path insertion in the current tab
-- Background upload to the SSH target
-- Very short remote paths: `/tmp/i/1.png`, `/tmp/i/2.png`, ...
-- Session scoping by the actual Windows Terminal window handle
-- PowerShell helpers for `cssh`, `cssh-status`, `cssh-on`, and `cssh-off`
-- AutoHotkey startup integration
+```
+┌──────────────────────────────────────────────────────┐
+│  Windows Terminal                                    │
+│  ┌────────────────────────────────────────────────┐  │
+│  │ $ cssh user@server                             │  │
+│  │                                                │  │
+│  │ claude> describe this UI bug                   │  │
+│  │ claude> /tmp/i/1.png  ← Ctrl+V inserted this  │  │
+│  │                                                │  │
+│  └────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
+         │                              ▲
+         │  scp (background upload)     │  ssh
+         ▼                              │
+   ┌───────────┐                 ┌─────────────┐
+   │ /tmp/i/   │                 │ Claude Code  │
+   │  1.png    │────────────────▶│ reads image  │
+   └───────────┘  path ready     └─────────────┘
+```
+
+## How It Works
+
+When you press `Ctrl+V` inside a `cssh` session with an image on the clipboard:
+
+1. A short remote path is reserved (e.g., `/tmp/i/1.png`)
+2. That path is typed into the terminal immediately
+3. The image is uploaded to the remote host in the background via `scp`
+4. `Enter` is temporarily blocked until the upload finishes, so the tool does not try to read the file before it exists
+
+## Features
+
+- **Same-tab SSH** — `cssh` runs in your current Windows Terminal tab, no new windows
+- **Instant path insertion** — the path appears immediately, upload happens in the background
+- **Short paths** — `/tmp/i/1.png`, `/tmp/i/2.png`, … easy to type or reference
+- **Window-scoped sessions** — binding is tied to the Windows Terminal window handle
+- **PowerShell helpers** — `cssh`, `cssh-status`, `cssh-on`, `cssh-off`
+- **AutoHotkey integration** — a background watcher intercepts `Ctrl+V` only when a `cssh` session is active
 
 ## Requirements
 
-- Windows 10/11
-- Windows Terminal
+- Windows 10 or 11
+- [Windows Terminal](https://aka.ms/terminal)
 - PowerShell 5.1+ or PowerShell 7+
-- `ssh.exe` and `scp.exe` available on Windows
-- AutoHotkey v2
-- Passwordless SSH access to the remote host recommended
+- `ssh.exe` and `scp.exe` on PATH (included with Windows 10+)
+- [AutoHotkey v2](https://www.autohotkey.com/)
+- Passwordless SSH (key-based auth) recommended
 
 ## Install
 
@@ -41,74 +69,49 @@ cd windows-terminal-ssh-image-paste
 .\scripts\install.ps1
 ```
 
-If AutoHotkey v2 is not installed:
+To also install AutoHotkey v2 automatically:
 
 ```powershell
 .\scripts\install.ps1 -InstallAutoHotkey
 ```
 
-The installer will:
+The installer:
 
-- copy the scripts to `%USERPROFILE%\bin`
-- add a managed block to both PowerShell profiles
-- create a Startup entry for the AutoHotkey script
-- start or restart the AutoHotkey watcher
+- Copies scripts to `%USERPROFILE%\bin`
+- Adds a managed block to your PowerShell profile
+- Creates a Startup shortcut for the AutoHotkey watcher
+- Starts the AutoHotkey watcher immediately
 
 ## Quick Start
 
-Open a PowerShell tab in Windows Terminal, then:
+1. Open a PowerShell tab in Windows Terminal
+2. Connect with `cssh` instead of `ssh`:
 
-```powershell
-cssh user@host
-```
+   ```powershell
+   cssh user@host
+   ```
 
-`cssh` stays in the current Windows Terminal tab. Inside that SSH session:
-
-1. copy an image to the Windows clipboard
-2. press `Ctrl+V`
-3. wait briefly before pressing `Enter`
-
-`cssh-here` is kept as an explicit alias for the same in-place behavior.
-
-If you are already inside an SSH tab and want to bind it manually:
-
-```powershell
-cssh-on -Target user@host
-cssh-status
-cssh-off
-```
+3. Copy an image to your Windows clipboard (screenshot, snip, etc.)
+4. Press `Ctrl+V` — the remote path appears in the terminal
+5. Wait briefly for the upload indicator, then press `Enter`
 
 ## Commands
 
-```powershell
-cssh user@host
-cssh-here user@host
-cssh-status
-cssh-on -Target user@host -WindowHandle 0x12345
-cssh-off -Marker __CSSH__:...
-```
-
-`cssh` is the normal entrypoint. It runs `ssh.exe` in the current Windows Terminal tab, binds that window to the SSH target, and clears the binding when the SSH process exits.
-
-`cssh-here` is an explicit alias for the same in-place behavior as `cssh`.
+| Command | Description |
+|---------|-------------|
+| `cssh user@host` | Connect via SSH with image paste enabled |
+| `cssh-here user@host` | Explicit alias for same-tab behavior |
+| `cssh-status` | Show the current session binding |
+| `cssh-on -Target user@host` | Manually bind the current tab to a host |
+| `cssh-off` | Clear the current session binding |
 
 ## Uninstall
-
-From the repo:
 
 ```powershell
 .\scripts\uninstall.ps1
 ```
 
-This removes:
-
-- `%USERPROFILE%\bin\ClaudeSsh.ps1`
-- `%USERPROFILE%\bin\ClaudeSshImagePaste.ps1`
-- `%USERPROFILE%\bin\ClaudeSshImagePaste.ahk`
-- the Startup entry
-- the managed PowerShell profile block
-
-To also remove local runtime state and caches:
+To also remove local state and caches:
 
 ```powershell
 .\scripts\uninstall.ps1 -RemoveState
@@ -120,30 +123,26 @@ To also remove local runtime state and caches:
 .\scripts\smoke-test.ps1
 ```
 
-This checks:
+Checks PowerShell script syntax, AutoHotkey availability, and installation prerequisites.
 
-- PowerShell syntax for the bundled scripts
-- AutoHotkey availability and hotkey script loadability
-- presence of the expected installation/runtime prerequisites
+## Project Layout
 
-## Repository Layout
-
-```text
+```
 bin/
-  ClaudeSsh.ps1
-  ClaudeSshImagePaste.ps1
-  ClaudeSshImagePaste.ahk
+  ClaudeSsh.ps1               # SSH wrapper and session management
+  ClaudeSshImagePaste.ps1     # Image capture, upload, and path logic
+  ClaudeSshImagePaste.ahk     # AutoHotkey Ctrl+V interceptor
 scripts/
-  install.ps1
-  uninstall.ps1
-  smoke-test.ps1
+  install.ps1                 # Installer
+  uninstall.ps1               # Uninstaller
+  smoke-test.ps1              # Verification script
 ```
 
-## Known Limits
+## Known Limitations
 
-- This is for terminal workflows, not GUI attachment chips.
-- The remote path is inserted before upload completes, so `Enter` is blocked during upload.
-- Session binding is scoped to a Windows Terminal window, not a tab. If you use `cssh`/`cssh-here` in a window that also contains local WSL tabs, do not switch to another tab between copying and pasting.
+- Designed for terminal-based workflows, not GUI image attachment UIs
+- The remote path is inserted before the upload finishes — `Enter` is blocked during upload to prevent reading a missing file
+- Session binding is per-window, not per-tab. Avoid switching tabs between copy and paste if the window also has local WSL tabs
 
 ## License
 
